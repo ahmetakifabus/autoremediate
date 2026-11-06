@@ -9,6 +9,7 @@ mod gemini;
 mod orchestrator;
 mod osv;
 mod patcher;
+mod providers;
 mod recon;
 mod report;
 mod scanner;
@@ -20,11 +21,10 @@ use std::process::ExitCode;
 
 use tracing::{error, info, warn};
 
-use crate::ai::{AnthropicClient, LlmConfig, PatchProvider};
+use crate::ai::PatchProvider;
 use crate::controls::{ControlFinding, Project};
 use crate::deps::DepFinding;
 use crate::error::{Error, Result};
-use crate::gemini::{GeminiClient, GeminiConfig};
 use crate::orchestrator::{Config, Orchestrator, Outcome};
 use crate::patcher::Patcher;
 use crate::recon::SiteReport;
@@ -53,7 +53,12 @@ Bağımlılık:  package-lock.json, yarn.lock, pnpm-lock.yaml, package.json, com
   --no-harden            Eksik savunmaları (kameraları / kilitleri) kurma, sadece duvarları yamala
   --fix-deps             Savunmasız bağımlılıkları paket yöneticisiyle yükselt; açık kapanmazsa
                          ya da --validate başarısızsa geri al
-  --provider <ad>        gemini | anthropic (verilmezse anahtarı tanımlı olan seçilir)
+  --provider <ad>        LLM sağlayıcısı: anthropic, openai, gemini, openrouter, deepseek, mistral, xai,
+                         groq, together, fireworks, cerebras, cohere, qwen, kimi, glm, huggingface,
+                         github, nvidia, azure, custom, ollama, lmstudio
+                         (verilmezse anahtarı tanımlı olan ilk sağlayıcı seçilir)
+  --model <ad>           Sağlayıcının modelini değiştir (ör. gpt-5-mini, deepseek-reasoner)
+  --providers            Tüm sağlayıcıları, anahtar değişkenlerini ve hazır olanları listele
   --max-iter <N>         En fazla döngü sayısı (varsayılan 5, üst sınır 20)
   --validate \"<komut>\"   Her değişiklikten sonra çalışacak doğrulama (örn. \"npm test\", \"cargo check -q\")
   --validate-dir <dizin> Doğrulama komutunun çalışma dizini
@@ -65,21 +70,17 @@ Bağımlılık:  package-lock.json, yarn.lock, pnpm-lock.yaml, package.json, com
   --html <dosya>         Tek dosyalık HTML rapor yaz (güvenlik puanı + tüm bölümler)
   --init-ci              Projeye bekçi ekle: her push/PR/hafta tarayan GitHub Actions iş akışı
 
-Ortam: GEMINI_API_KEY (+ GEMINI_MODEL) veya ANTHROPIC_API_KEY (+ AUTOFIX_MODEL); --scan-only için gerekmez";
+Ortam: sağlayıcının API anahtarı (ör. OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY,
+OPENROUTER_API_KEY, DEEPSEEK_API_KEY, GROQ_API_KEY...; tam liste: --providers). --scan-only için gerekmez";
 
 /// Bundan büyük kaynak dosyaları (genelde paketlenmiş çıktı) atlanır
 const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024;
 
-#[derive(Clone, Copy)]
-enum Provider {
-    Gemini,
-    Anthropic,
-}
-
 struct Cli {
     target: Option<PathBuf>,
     site: Option<String>,
-    provider: Option<Provider>,
+    provider: Option<String>,
+    model: Option<String>,
     dry_run: bool,
     scan_only: bool,
     harden: bool,
@@ -101,6 +102,7 @@ fn parse_args() -> Result<Cli> {
         target: None,
         site: None,
         provider: None,
+        model: None,
         dry_run: false,
         scan_only: false,
         harden: true,
@@ -131,12 +133,14 @@ fn parse_args() -> Result<Cli> {
             "--sarif" => cli.sarif = Some(PathBuf::from(args.next().ok_or_else(|| need("--sarif"))?)),
             "--html" => cli.html = Some(PathBuf::from(args.next().ok_or_else(|| need("--html"))?)),
             "--provider" => {
-                cli.provider = Some(match args.next().ok_or_else(|| need("--provider"))?.as_str() {
-                    "gemini" => Provider::Gemini,
-                    "anthropic" => Provider::Anthropic,
-                    other => return Err(Error::Config(format!("bilinmeyen sağlayıcı: {other}"))),
-                });
+                let v = args.next().ok_or_else(|| need("--provider"))?.to_ascii_lowercase();
+                if !providers::ids().contains(&v.as_str()) && !matches!(v.as_str(), "claude" | "google") {
+                    return Err(Error::Config(format!("bilinmeyen sağlayıcı: {v}. Seçenekler: {}", providers::ids().join(", "))));
+                }
+                cli.provider = Some(v);
             }
+            "--model" => cli.model = Some(args.next().ok_or_else(|| need("--model"))?),
+            "--providers" => return Err(Error::Config(providers_table())),
             "--max-iter" => {
                 let v = args.next().ok_or_else(|| need("--max-iter"))?;
                 cli.max_iter = v
@@ -492,28 +496,17 @@ async fn run() -> Result<ExitCode> {
     let mut code = u8::from(site_bad);
     let needs_llm = !targets.sources.is_empty() || (cli.harden && !controls::audit(&project).is_empty());
     if needs_llm {
-        let provider = match cli.provider {
-            Some(p) => Some(p),
-            None => match detect_provider() {
-                Ok(p) => Some(p),
-                // Yalnızca bağımlılık yükseltmesi istendiyse LLM adımları atlanabilir
-                Err(e) if cli.fix_deps => {
-                    warn!("{e} — duvar/kamera adımları atlandı, yalnızca bağımlılıklar yükseltilecek");
-                    None
-                }
-                Err(e) => return Err(e),
-            },
-        };
-        let c = match provider {
-            Some(Provider::Gemini) => {
-                let cfg = GeminiConfig::from_env()?;
-                info!("Sağlayıcı: Gemini ({})", cfg.model());
-                drive(GeminiClient::new(cfg)?, &cli, &targets.sources, &project).await?
+        let c = match providers::select(cli.provider.as_deref(), cli.model.as_deref()) {
+            Ok((provider, label)) => {
+                info!("Sağlayıcı: {label}");
+                drive(provider, &cli, &targets.sources, &project).await?
             }
-            Some(Provider::Anthropic) => {
-                drive(AnthropicClient::new(LlmConfig::from_env()?)?, &cli, &targets.sources, &project).await?
+            // Yalnızca bağımlılık yükseltmesi istendiyse ve sağlayıcı seçilmediyse LLM adımları atlanabilir
+            Err(e) if cli.fix_deps && cli.provider.is_none() => {
+                warn!("{e} — duvar/kamera adımları atlandı, yalnızca bağımlılıklar yükseltilecek");
+                0
             }
-            None => 0,
+            Err(e) => return Err(e),
         };
         code = code.max(c);
     }
@@ -570,18 +563,16 @@ async fn run() -> Result<ExitCode> {
     Ok(ExitCode::from(code))
 }
 
-/// --provider verilmediyse hangi anahtar tanımlıysa onu seç.
-fn detect_provider() -> Result<Provider> {
-    let has = |k: &str| std::env::var(k).map(|v| !v.trim().is_empty()).unwrap_or(false);
-    if has("GEMINI_API_KEY") {
-        Ok(Provider::Gemini)
-    } else if has("ANTHROPIC_API_KEY") {
-        Ok(Provider::Anthropic)
-    } else {
-        Err(Error::Config(
-            "API anahtarı bulunamadı: GEMINI_API_KEY veya ANTHROPIC_API_KEY tanımlayın".into(),
-        ))
+/// `--providers` çıktısı
+fn providers_table() -> String {
+    let mut s = String::from("LLM sağlayıcıları (✔ = ortamda hazır; --provider verilmezse ilk hazır olan seçilir)\n\n");
+    s.push_str(&format!("  {:<12} {:<40} {:<55} {}\n", "--provider", "Servis", "Ortam değişkeni", "Varsayılan model"));
+    for (id, name, key, model, ready) in providers::catalog() {
+        let mark = if ready { "✔" } else { " " };
+        s.push_str(&format!("{mark} {id:<12} {name:<40} {key:<55} {model}\n"));
     }
+    s.push_str("\nModeli değiştirmek için --model <ad> ya da sağlayıcının *_MODEL değişkeni (ör. OPENAI_MODEL).");
+    s
 }
 
 /// Önce duvarlar (kod açıkları) yamalanır, sonra kameralar ve kilitler takılır.

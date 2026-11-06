@@ -40,7 +40,7 @@ autoremediate <proje-dizini> --scan-only
 autoremediate <proje-dizini> --scan-only --site https://siteniz.com --osv --html rapor.html
 
 # Önce ne yapılacağını gör (dosyaya yazmaz)
-GEMINI_API_KEY=... autoremediate <proje-dizini> --dry-run --fix-deps
+OPENAI_API_KEY=... autoremediate <proje-dizini> --dry-run --fix-deps
 
 # Hepsi: duvarları yamala, kameraları ve kilitleri tak, malzemeyi değiştir; her adımda testleri çalıştır
 ANTHROPIC_API_KEY=... autoremediate <proje-dizini> --fix-deps --validate "npm test"
@@ -62,7 +62,9 @@ autoremediate <proje-dizini> --init-ci --scan-only
 | `--dry-run` | Yamaları, kurulacak savunmaları ve yükseltmeleri göster; dosyaya yazma |
 | `--no-harden` | Kameraları ve kilitleri takma, sadece duvarları yamala |
 | `--fix-deps` | Savunmasız bağımlılıkları yükselt (npm/yarn/pnpm, composer, cargo, pip/poetry/pipenv, go) |
-| `--provider gemini\|anthropic` | LLM sağlayıcısı (verilmezse tanımlı anahtara göre seçilir) |
+| `--provider <ad>` | LLM sağlayıcısı (aşağıdaki tablo; verilmezse anahtarı tanımlı ilk sağlayıcı) |
+| `--model <ad>` | Sağlayıcının modelini değiştir |
+| `--providers` | Sağlayıcıları ve ortamda hazır olanları listele |
 | `--max-iter N` | En fazla onarım turu (varsayılan 5, en fazla 20) |
 | `--validate "<komut>"` | Her değişiklikten sonra çalışacak doğrulama; başarısızsa değişiklik geri alınır |
 | `--validate-dir <dizin>` | Doğrulama komutunun çalışma dizini |
@@ -73,9 +75,46 @@ autoremediate <proje-dizini> --init-ci --scan-only
 | `--html <dosya>` | Tek dosyalık HTML rapor (puan + tüm bölümler) |
 | `--init-ci` | `.github/workflows/autoremediate.yml` bekçisini oluştur |
 
-Ortam değişkenleri: `GEMINI_API_KEY` (+ `GEMINI_MODEL`), `ANTHROPIC_API_KEY` (+ `AUTOFIX_MODEL`).
 Bulgu varsa çıkış kodu 1, hata durumunda 2'dir; bu sayede CI'da doğrudan kullanılabilir.
 
+## LLM sağlayıcıları
+
+Yamalama ve kamera/kilit takma için bir LLM gerekir. Tarama için (`--scan-only`) gerekmez.
+Hangi sağlayıcının anahtarı tanımlıysa o kullanılır. Birden fazla anahtar tanımlıysa tablodaki
+sıraya göre ilki seçilir; istediğinizi `--provider` ile seçebilirsiniz.
+
+| `--provider` | Servis | Ortam değişkeni | Varsayılan model |
+|---|---|---|---|
+| `anthropic` | Anthropic Claude | `ANTHROPIC_API_KEY` | claude-sonnet-5-5 |
+| `gemini` | Google Gemini | `GEMINI_API_KEY` | gemini-2.5-flash |
+| `openai` | OpenAI | `OPENAI_API_KEY` | gpt-5 |
+| `openrouter` | OpenRouter (yüzlerce model, tek anahtar) | `OPENROUTER_API_KEY` | anthropic/claude-sonnet-4.5 |
+| `deepseek` | DeepSeek | `DEEPSEEK_API_KEY` | deepseek-chat |
+| `mistral` | Mistral AI | `MISTRAL_API_KEY` | mistral-large-latest |
+| `xai` | xAI (Grok) | `XAI_API_KEY` | grok-4 |
+| `groq` | Groq | `GROQ_API_KEY` | openai/gpt-oss-120b |
+| `together` | Together AI | `TOGETHER_API_KEY` | Qwen3-Coder-480B |
+| `fireworks` | Fireworks AI | `FIREWORKS_API_KEY` | qwen3-coder-480b |
+| `cerebras` | Cerebras | `CEREBRAS_API_KEY` | gpt-oss-120b |
+| `cohere` | Cohere | `COHERE_API_KEY` | command-a-03-2025 |
+| `qwen` | Alibaba Qwen (DashScope) | `DASHSCOPE_API_KEY` | qwen3-coder-plus |
+| `kimi` | Moonshot Kimi | `MOONSHOT_API_KEY` | kimi-k2-0905-preview |
+| `glm` | Zhipu GLM (Z.ai) | `ZAI_API_KEY` | glm-4.6 |
+| `huggingface` | Hugging Face Inference | `HF_TOKEN` | openai/gpt-oss-120b |
+| `github` | GitHub Models | `GITHUB_MODELS_TOKEN` | openai/gpt-4.1 |
+| `nvidia` | NVIDIA NIM | `NVIDIA_API_KEY` | qwen3-coder-480b |
+| `azure` | Azure OpenAI | `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_ENDPOINT` + `AZURE_OPENAI_DEPLOYMENT` | (dağıtım adı) |
+| `custom` | Herhangi bir OpenAI uyumlu uç nokta (vLLM, LiteLLM...) | `OPENAI_COMPAT_API_KEY` + `OPENAI_COMPAT_BASE_URL` + `OPENAI_COMPAT_MODEL` | (zorunlu) |
+| `ollama` | Ollama (yerel, anahtarsız, kod dışarı çıkmaz) | `OLLAMA_MODEL` (+ `OLLAMA_BASE_URL`) | qwen2.5-coder:14b |
+| `lmstudio` | LM Studio (yerel, anahtarsız) | `LMSTUDIO_MODEL` (+ `LMSTUDIO_BASE_URL`) | (zorunlu) |
+
+- Model, `--model` ile ya da sağlayıcının `*_MODEL` değişkeniyle değiştirilir (`OPENAI_MODEL`,
+  `DEEPSEEK_MODEL`, `GEMINI_MODEL`, Anthropic için `AUTOFIX_MODEL` ...). Varsayılan modeller
+  zamanla eskiyebilir; sağlayıcınızın güncel model adını kullanın.
+- Anahtar yalnızca istek başlığında gönderilir; URL'ye, log'a ya da hata mesajına yazılmaz.
+  Anahtarlı istekler yalnızca HTTPS ya da bu makinedeki bir sunucu üzerinden yapılır.
+- Kaynak kodunuzun bilgisayarınızdan çıkmasını istemiyorsanız `ollama` ya da `lmstudio` kullanın.
+- `autoremediate --providers` tüm listeyi ve ortamda hazır olanları gösterir.
 ## Bekçi (GitHub Actions)
 
 `--init-ci` projeye bir iş akışı ekler. Bu iş akışı her push'ta, her PR'da ve her pazartesi

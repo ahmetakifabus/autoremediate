@@ -47,12 +47,15 @@ impl GeminiConfig {
 
     /// GEMINI_API_KEY (zorunlu), GEMINI_MODEL (varsayılan gemini-2.5-flash),
     /// GEMINI_BASE_URL (opsiyonel; test/proxy için).
-    pub fn from_env() -> Result<Self> {
+    pub fn from_env_with_model(model: Option<&str>) -> Result<Self> {
         let key = std::env::var("GEMINI_API_KEY")
             .map_err(|_| Error::Config("GEMINI_API_KEY ortam değişkeni tanımlı değil".into()))?;
         Self::new(
             key,
-            std::env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-2.5-flash".into()),
+            model
+                .map(String::from)
+                .or_else(|| std::env::var("GEMINI_MODEL").ok())
+                .unwrap_or_else(|| "gemini-2.5-flash".into()),
             std::env::var("GEMINI_BASE_URL")
                 .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".into()),
         )
