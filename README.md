@@ -1,24 +1,19 @@
 # autoremediate
 
-Kaynak koddaki güvenlik açıklarını bulan, bir yapay zekâ modeline (Gemini veya Claude)
-düzelttiren ve düzeltmeyi **yeniden tarayarak doğrulayan** komut satırı aracı. Ayrıca
-projenin bağımlılıklarını React2Shell gibi framework açıklarına karşı denetler.
+Sitenizi bir bina gibi düşünün. Hırsız binaya dışarıdan bakar: duvar kırık mı,
+kamera var mı, pencere açık mı, paspasın altında anahtar unutulmuş mu? Bir zayıflık
+görürse oradan girer.
 
-## Ne yapar?
+**autoremediate** binaya hırsızın gözüyle bakar, kırık duvarları **yamalar**, eksik
+kameraları **takar** ve her işten sonra yeniden kontrol ederek gerçekten kapandığını
+**doğrular**.
 
-1. **Kod taraması**: Rust, PHP ve JavaScript/TypeScript dosyalarında ~50 kuralla
-   komut enjeksiyonu, kod çalıştırma (RCE), SQL/NoSQL enjeksiyonu, güvensiz
-   serileştirme, dosya dahil etme (LFI/RFI), web shell kalıpları, prototype pollution,
-   path traversal, SSRF, XSS, sabit parolalar ve benzerlerini arar. Kullanıcı girdisi
-   değişkenler arasında izlenir (`$c = $_GET['c']; ... system($c)` yakalanır).
-2. **Otomatik yama**: Bulguları LLM'e gönderir, gelen yamayı yedek alarak uygular,
-   dosyayı yeniden tarar. Açık sayısı artarsa veya döngüye girerse yamayı geri alır.
-3. **Bağımlılık denetimi**: `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`,
-   `composer.lock`, `Cargo.lock` dosyalarındaki sürümleri kontrol eder.
-   - İnternetsiz çalışan yerleşik tablo: React2Shell (CVE-2025-55182, CVE-2025-66478),
-     ardından gelen RSC açıkları ve Next.js middleware atlatma (CVE-2025-29927).
-   - `--osv` ile canlı [OSV](https://osv.dev) veritabanı: yeni yayımlanan tüm açıklar.
-   - Paketler otomatik yükseltilmez; çalıştırılacak komut önerilir.
+| | Ne bakar? | Ne yapar? |
+|---|---|---|
+| **1) Hırsızın gözü** | Yayındaki siteye dışarıdan: HTTPS, güvenlik başlıkları, çerez bayrakları, sürüm ifşası, dışarıda unutulmuş `.env` / `.git` / yedek / `phpinfo` | Raporlar ve hangi kod değişikliğinin kapatacağını söyler |
+| **2) Kırık duvarlar** | Koddaki açıklar (Rust, PHP, JS/TS): komut enjeksiyonu, RCE, SQL/NoSQL enjeksiyonu, güvensiz serileştirme, LFI/RFI, web shell kalıpları, prototype pollution, path traversal, SSRF, XSS, sabit parolalar | LLM ile yamalar, yeniden tarar; açık artarsa geri alır |
+| **3) Eksik kameralar** | Hiç kurulmamış savunmalar: helmet / güvenlik başlıkları, rate limit, CSRF, güvenli oturum çerezi, istek kaydı, Next.js başlıkları ve Server Action doğrulaması, yükleme klasöründe PHP çalıştırma yasağı, `.env` koruması | Takar (dosya oluşturur veya LLM ile ekler), sonra savunmanın gerçekten yerinde olduğunu doğrular |
+| **4) Çürük malzeme** | Bağımlılıklar: React2Shell (CVE-2025-55182 / CVE-2025-66478), Next.js açıkları; `--osv` ile tüm güncel açıklar | Güvenli sürümü hesaplayıp yükseltme komutunu verir |
 
 ## Kurulum
 
@@ -29,35 +24,54 @@ cargo build --release
 ## Kullanım
 
 ```bash
-# Sadece tara (API anahtarı gerekmez)
+# Sadece rapor: hiçbir dosya değişmez, API anahtarı gerekmez
 ./target/release/autoremediate <proje-dizini> --scan-only
 
-# Bağımlılıkları canlı OSV veritabanında da sorgula
-./target/release/autoremediate <proje-dizini> --scan-only --osv
+# Rapor + yayındaki siteye dışarıdan bakış + güncel açık veritabanı
+./target/release/autoremediate <proje-dizini> --scan-only --site https://siteniz.com --osv
 
-# CI için JSON çıktı (bulgu varsa çıkış kodu 1)
-./target/release/autoremediate <proje-dizini> --scan-only --json
+# Sadece dışarıdan bakış
+./target/release/autoremediate --site https://siteniz.com
 
-# Yamayı üret ama dosyaya yazma
-GEMINI_API_KEY=... ./target/release/autoremediate <dosya-veya-dizin> --dry-run
+# Önce ne yapılacağını gör (dosyaya yazmaz)
+GEMINI_API_KEY=... ./target/release/autoremediate <proje-dizini> --dry-run
 
-# Otomatik düzelt + her yamadan sonra derleme/tip kontrolü
-ANTHROPIC_API_KEY=... ./target/release/autoremediate src --validate "npx tsc --noEmit"
+# Duvarları yamala + kameraları tak + her değişiklikten sonra tip kontrolü
+ANTHROPIC_API_KEY=... ./target/release/autoremediate <proje-dizini> --validate "npx tsc --noEmit"
 ```
+
+> `--site` yalnızca birkaç sıradan GET isteği gönderir (saldırı yükü yok, giriş denemez),
+> ama yine de **yalnızca sahibi olduğunuz veya test izniniz olan siteler** için kullanın.
 
 | Seçenek | Açıklama |
 |---|---|
 | `--scan-only` | Sadece tara ve raporla |
-| `--dry-run` | Yamayı göster, dosyaya yazma |
+| `--site <adres>` | Yayındaki siteye dışarıdan bak |
+| `--dry-run` | Yamaları ve kurulacak savunmaları göster, dosyaya yazma |
+| `--no-harden` | Kameraları takma, sadece duvarları yamala |
 | `--provider gemini\|anthropic` | LLM sağlayıcısı (verilmezse tanımlı anahtara göre seçilir) |
 | `--max-iter N` | En fazla onarım turu (varsayılan 5, en fazla 20) |
-| `--validate "<komut>"` | Her yamadan sonra çalışacak doğrulama; başarısızsa yama geri alınır |
+| `--validate "<komut>"` | Her değişiklikten sonra çalışacak doğrulama; başarısızsa geri alınır |
 | `--validate-dir <dizin>` | Doğrulama komutunun çalışma dizini |
 | `--osv` | Bağımlılıkları osv.dev'de sorgula (yalnızca paket adı + sürüm gönderilir) |
 | `--no-deps` | Bağımlılık denetimini atla |
-| `--json` | `--scan-only` çıktısını JSON ver |
+| `--json` | `--scan-only` çıktısını JSON ver (CI için; bulgu varsa çıkış kodu 1) |
 
 Ortam değişkenleri: `GEMINI_API_KEY` (+ `GEMINI_MODEL`), `ANTHROPIC_API_KEY` (+ `AUTOFIX_MODEL`).
+
+## Kameralar nasıl takılır?
+
+- **Dosya ile** (LLM gerekmez): Next.js projesinde `next.config.mjs` yoksa güvenlik
+  başlıklarıyla oluşturulur; PHP yükleme klasörüne betik çalıştırmayı kapatan
+  `.htaccess` konur; `.env` dosyası `.gitignore`'a eklenir. Var olan dosyanın üzerine
+  asla yazılmaz.
+- **LLM ile**: savunma ilgili dosyaya en az değişiklikle eklenir. Ardından iki
+  kontrol yapılır: kod taraması yeni bir açık bulmamalı **ve** savunma gerçekten
+  görünmeli. Biri tutmazsa değişiklik geri alınır.
+- **Elle**: `.git` ya da `.env` dosyasının herkese açık klasörde olması gibi durumlarda
+  ne yapılacağı yazılır.
+- Yeni savunma bir paket gerektiriyorsa (`helmet`, `express-rate-limit`, `morgan`, `zod`)
+  kurulum komutu sonda gösterilir.
 
 ## Bulgu bastırma
 
@@ -74,18 +88,21 @@ doğrulanmalıdır.
 
 ## Güvenlik notları
 
-- LLM çıktısı güvenilmez kabul edilir: hiçbir zaman çalıştırılmaz, sadece dosyaya
-  yazılır; boş, kesik veya anormal büyüyen yamalar reddedilir.
+- LLM çıktısı güvenilmez kabul edilir: hiçbir zaman çalıştırılmaz; boş, kesik veya
+  anormal büyüyen yamalar reddedilir.
 - İlk değişiklikten önce `<dosya>.autofix.orig` yedeği alınır.
 - Doğrulama komutu kabuk (shell) olmadan çalıştırılır.
 - Crate'te `unsafe` kod yasaktır.
 
 ## Sınırlar
 
+- Hiçbir araç bir siteyi "kırılamaz" yapamaz. Bu araç bilinen açık türlerini, bilinen
+  eksik savunmaları ve bilinen savunmasız sürümleri yakalar; mantık hatalarını ve
+  eksik yetki kontrollerini bulamaz.
 - Kurallar satır bazlıdır: birden fazla satıra yayılan çağrıları ve dosyalar arası
   veri akışını kaçırabilir, yanlış alarm verebilir.
-- Mantık hatalarını ve eksik yetki kontrollerini bulamaz.
-- Sunucudaki PHP/Node çalışma ortamı sürümünü denetlemez.
+- Rate limit ve güvenlik başlıkları uygulamanın davranışını etkileyebilir; kurulumdan
+  sonra uygulamanızı test edin.
 
 ## Örnekler ve antivirüs
 

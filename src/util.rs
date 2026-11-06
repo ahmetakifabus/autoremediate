@@ -6,3 +6,9 @@ pub fn truncate_chars(s: &str, max: usize) -> String {
     }
     out
 }
+
+/// Dizin taramalarında atlanan (üretilmiş / üçüncü taraf) dizinler
+pub const SKIP_DIRS: &[&str] = &[
+    ".git", "target", "node_modules", "vendor", ".next", ".nuxt", ".svelte-kit", "dist", "build", "out",
+    "coverage", "bower_components", ".turbo", ".vercel",
+];

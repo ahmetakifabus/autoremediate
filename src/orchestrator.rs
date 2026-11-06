@@ -58,6 +58,18 @@ impl<P: PatchProvider> Orchestrator<P> {
         Self { scanner, provider, patcher, cfg }
     }
 
+    pub fn scanner(&self) -> &Scanner {
+        &self.scanner
+    }
+
+    pub fn provider(&self) -> &P {
+        &self.provider
+    }
+
+    pub fn patcher(&self) -> &Patcher {
+        &self.patcher
+    }
+
     async fn read_source(&self, path: &Path) -> Result<String> {
         let meta = tokio::fs::symlink_metadata(path).await.map_err(|e| Error::io(path, e))?;
         if meta.file_type().is_symlink() || !meta.is_file() {
