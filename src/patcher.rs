@@ -77,7 +77,7 @@ impl Patcher {
         let (prog, args) = cmd
             .split_first()
             .ok_or_else(|| Error::Config("boş doğrulama komutu".into()))?;
-        let mut c = tokio::process::Command::new(prog);
+        let mut c = crate::util::command(prog);
         c.args(args).kill_on_drop(true);
         if let Some(dir) = &self.validate_dir {
             c.current_dir(dir);

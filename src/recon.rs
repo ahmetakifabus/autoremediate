@@ -78,6 +78,18 @@ const PROBES: &[Probe] = &[
     Probe { path: "/.DS_Store", id: "WEB207", severity: Severity::Low,
         title: ".DS_Store dosyası açık (klasör içeriğini sızdırır)", proof: r"Bud1",
         remedy: ".DS_Store dosyalarını sunucudan silin ve dağıtıma eklemeyin." },
+    Probe { path: "/phpmyadmin/", id: "WEB208", severity: Severity::High,
+        title: "phpMyAdmin internete açık", proof: r"(?i)<title>[^<]*phpMyAdmin|pma_username|phpmyadmin\.css",
+        remedy: "Veritabanı yönetim panelini internetten kaldırın ya da yalnızca VPN / IP allowlist ile erişilebilir yapın." },
+    Probe { path: "/adminer.php", id: "WEB208", severity: Severity::High,
+        title: "Adminer veritabanı paneli internete açık", proof: r"(?i)<title>[^<]*Adminer|adminer\.org",
+        remedy: "adminer.php dosyasını sunucudan silin; gerekiyorsa yalnızca SSH tüneli ile kullanın." },
+    Probe { path: "/wp-config.php.bak", id: "WEB204", severity: Severity::Critical,
+        title: "WordPress yapılandırma yedeği indirilebilir", proof: r"DB_PASSWORD|DB_NAME",
+        remedy: "Yedek dosyayı silin ve veritabanı parolasını değiştirin." },
+    Probe { path: "/config.php.bak", id: "WEB204", severity: Severity::Critical,
+        title: "PHP yapılandırma yedeği indirilebilir (config.php.bak)", proof: r"<\?php|\$db|password",
+        remedy: "Yedek dosyayı silin ve içindeki parolaları değiştirin." },
 ];
 
 fn re(p: &str) -> Result<Regex> {
@@ -271,8 +283,8 @@ pub async fn inspect(raw_url: &str) -> Result<SiteReport> {
         }
         let ctype = header(r.headers(), "content-type").unwrap_or("").to_ascii_lowercase();
         let text = body_prefix(r).await;
-        // HTML hata/SPA sayfaları kanıt sayılmaz (phpinfo/server-status hariç: onlar HTML'dir)
-        let html_ok = matches!(probe.id, "WEB205" | "WEB206");
+        // HTML hata/SPA sayfaları kanıt sayılmaz (phpinfo/server-status/yönetim panelleri hariç)
+        let html_ok = matches!(probe.id, "WEB205" | "WEB206" | "WEB208");
         if ctype.contains("text/html") && !html_ok {
             continue;
         }

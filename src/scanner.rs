@@ -61,6 +61,8 @@ pub enum Lang {
     Rust,
     Php,
     Js,
+    Python,
+    Go,
 }
 
 impl Lang {
@@ -74,6 +76,8 @@ impl Lang {
             "rs" => Some(Lang::Rust),
             "php" | "phtml" | "php3" | "php4" | "php5" | "php7" | "phps" => Some(Lang::Php),
             "js" | "mjs" | "cjs" | "jsx" | "ts" | "mts" | "cts" | "tsx" => Some(Lang::Js),
+            "py" | "pyw" => Some(Lang::Python),
+            "go" => Some(Lang::Go),
             _ => None,
         }
     }
@@ -83,6 +87,8 @@ impl Lang {
             Lang::Rust => "Rust",
             Lang::Php => "PHP",
             Lang::Js => "JavaScript/TypeScript",
+            Lang::Python => "Python",
+            Lang::Go => "Go",
         }
     }
 }
@@ -157,7 +163,9 @@ use Severity::{Critical, High, Low, Medium};
 const RS: &[Lang] = &[Lang::Rust];
 const PHP: &[Lang] = &[Lang::Php];
 const JS: &[Lang] = &[Lang::Js];
-const ALL: &[Lang] = &[Lang::Rust, Lang::Php, Lang::Js];
+const PY: &[Lang] = &[Lang::Python];
+const GO: &[Lang] = &[Lang::Go];
+const ALL: &[Lang] = &[Lang::Rust, Lang::Php, Lang::Js, Lang::Python, Lang::Go];
 
 // Node.js child_process çağrıları (`regex.exec(` gibi metotları dışlar)
 const JS_EXEC_FN: &str = r"(^|[^\w.$])(exec|execSync|spawn|spawnSync|execFile|execFileSync|execa|execaSync|execaCommand)\s*\(|\b(cp|childProcess|child_process|proc)\.(exec|execSync|spawn|spawnSync|execFile|execFileSync)\s*\(";
@@ -357,6 +365,113 @@ const RULES: &[RuleDef] = &[
         r"(?i)(token|secret|passw|otp|nonce|salt|session|reset)\w*\s*[:=][^;]*Math\.random\s*\("),
     rule("JS094", Medium, JS, "CORS her kökene kimlik bilgisiyle açık",
         r"origin\s*:\s*(true|['\x22]\*['\x22])[^;]*credentials\s*:\s*true"),
+    // ===================== Python ==========================================
+    rule("PY001", Critical, PY,
+        "Kullanıcı girdisi işletim sistemi komutuna ulaşıyor (komut enjeksiyonu / RCE)",
+        r"\bos\.(system|popen|exec[lv]p?e?|spawn\w*)\s*\(|\bsubprocess\.(run|call|check_call|check_output|Popen|getoutput|getstatusoutput)\s*\(")
+        .tainted().unless(r"shlex\.quote").group("py-exec"),
+    rule("PY002", High, PY, "Kabuk üzerinden komut çalıştırma (shell=True / os.system)",
+        r"\bshell\s*=\s*True|\bos\.(system|popen)\s*\(")
+        .group("py-exec"),
+    rule("PY010", Critical, PY,
+        "Kullanıcı girdisi kod olarak çalıştırılıyor (eval/exec/__import__ → RCE)",
+        r"(^|[^\w.])(eval|exec|compile)\s*\(|\b__import__\s*\(|\bimportlib\.import_module\s*\(")
+        .tainted().group("py-eval"),
+    rule("PY011", High, PY, "eval/exec kullanımı (kod enjeksiyonu riski)",
+        r"(^|[^\w.])(eval|exec)\s*\(")
+        .group("py-eval"),
+    rule("PY020", Critical, PY,
+        "Kullanıcı girdisi pickle/marshal ile çözülüyor (nesne enjeksiyonu → RCE)",
+        r"\b(pickle|cPickle|_pickle|dill|marshal|jsonpickle)\.(loads?|decode)\s*\(")
+        .tainted().group("py-deser"),
+    rule("PY021", Medium, PY, "pickle/marshal ile serileştirme çözme (güvenilmeyen veriyle RCE)",
+        r"\b(pickle|cPickle|_pickle|dill|marshal|jsonpickle)\.(loads?|decode)\s*\(")
+        .group("py-deser"),
+    rule("PY022", High, PY, "yaml.load güvenli yükleyici olmadan (nesne enjeksiyonu → RCE)",
+        r"\byaml\.(load|load_all|unsafe_load|full_load)\s*\(")
+        .unless(r"SafeLoader|CSafeLoader"),
+    rule("PY030", Critical, PY,
+        "Kullanıcı girdisi SQL sorgusuna doğrudan giriyor (SQL enjeksiyonu)",
+        r"\.(execute|executemany|executescript|raw|extra)\s*\(|(^|[^\w.])text\s*\(")
+        .tainted().unless(r##"\.(execute|executemany|raw)\s*\(\s*['"][^'"]*['"]\s*,"##).group("py-sql"),
+    rule("PY031", High, PY, "SQL sorgusu f-string / % / + / format ile kuruluyor (SQL enjeksiyonu)",
+        r##"(?i)\bf["'][^"']*\b(select\s.+?\sfrom|insert\s+into|update\s+\S+\s+set|delete\s+from)\b[^"']*\{|["']\s*(select\s.+?\sfrom|insert\s+into|update\s+\S+\s+set|delete\s+from)\b[^"']*["']\s*(%\s*[\w(]|\+\s*\w|\.format\s*\()"##)
+        .group("py-sql"),
+    rule("PY040", High, PY, "Kullanıcı kontrollü dosya yolu (path traversal / dosya yazarak web shell)",
+        r"(^|[^\w.])open\s*\(|\bsend_file\s*\(|\bos\.(remove|unlink|rmdir|makedirs)\s*\(|\bshutil\.\w+\s*\(|(^|[^\w.])Path\s*\(|\bFileResponse\s*\(")
+        .tainted().unless(r"secure_filename|basename|send_from_directory|safe_join"),
+    rule("PY050", High, PY, "Kullanıcı kontrollü URL'ye sunucu tarafı istek (SSRF)",
+        r"\b(requests|httpx|session|client)\.(get|post|put|patch|delete|head|request)\s*\(|\burlopen\s*\(|\baiohttp\.request\s*\(")
+        .tainted(),
+    rule("PY060", Critical, PY, "Kullanıcı girdisi şablon olarak işleniyor (SSTI → RCE)",
+        r"\brender_template_string\s*\(|(^|[^\w.])Template\s*\(|\.from_string\s*\(")
+        .tainted(),
+    rule("PY061", High, PY, "Kullanıcı girdisi kaçışsız HTML'e yazılıyor (XSS)",
+        r"\bMarkup\s*\(|\bmark_safe\s*\(|\bHttpResponse\s*\(|\bmake_response\s*\(|\bHTMLResponse\s*\(|\breturn\s+f['\x22]")
+        .tainted().unless(r"escape\s*\("),
+    rule("PY062", Medium, PY, "Kullanıcı kontrollü yönlendirme (open redirect)",
+        r"(^|[^\w.])redirect\s*\(|\bHttpResponseRedirect\s*\(|\bRedirectResponse\s*\(")
+        .tainted().unless(r"url_has_allowed_host_and_scheme|is_safe_url|url_for\s*\("),
+    rule("PY074", High, PY, "JWT imza / algoritma doğrulaması kapatılmış",
+        r##"verify_signature['"]?\s*:\s*False|algorithms\s*=\s*\[[^\]]*['"]none['"]|\bjwt\.decode\s*\([^)]*verify\s*=\s*False"##)
+        .group("py-verify"),
+    rule("PY070", High, PY, "TLS doğrulaması kapatılmış",
+        r"\bverify\s*=\s*False|_create_unverified_context|\bCERT_NONE\b")
+        .group("py-verify"),
+    rule("PY071", High, PY, "Hata ayıklama modu açık (Werkzeug debugger → RCE / bilgi sızıntısı)",
+        r"^\s*DEBUG\s*=\s*True|\.run\s*\([^)]*debug\s*=\s*True"),
+    rule("PY072", Medium, PY, "Kriptografik olarak zayıf özet algoritması (MD5/SHA-1)",
+        r"\bhashlib\.(md5|sha1)\s*\(|\bhashlib\.new\s*\(\s*['\x22](md5|sha1)"),
+    rule("PY073", Medium, PY, "Güvenlik değeri random modülüyle üretiliyor (tahmin edilebilir; secrets kullanın)",
+        r"(?i)(token|secret|passw|otp|nonce|salt|session|reset)\w*\s*=[^=][^#]*\brandom\.(random|randint|choice|choices|getrandbits|randrange)\s*\("),
+    rule("PY075", Medium, PY, "tempfile.mktemp yarış durumu (mkstemp / NamedTemporaryFile kullanın)",
+        r"\btempfile\.mktemp\s*\("),
+    rule("PY076", High, PY, "XML dış varlık (XXE) çözümlemesi açık",
+        r"resolve_entities\s*=\s*True|no_network\s*=\s*False"),
+    rule("PY077", Medium, PY, "CSRF koruması kapatılmış",
+        r"@csrf_exempt\b|WTF_CSRF_ENABLED['\x22\]]*\s*=\s*False"),
+
+    // ===================== Go ==============================================
+    rule("GO001", Critical, GO,
+        "Kullanıcı girdisi işletim sistemi komutuna ulaşıyor (komut enjeksiyonu / RCE)",
+        r"\bexec\.Command(Context)?\s*\(")
+        .tainted().group("go-exec"),
+    rule("GO002", High, GO, "Kabuk üzerinden komut çalıştırma (sh -c / cmd /c)",
+        r##"\bexec\.Command(Context)?\s*\([^)]*["`](sh|bash|/bin/sh|/bin/bash|cmd|cmd\.exe|powershell|pwsh)["`]\s*,\s*["`](-c|/c|/C|-Command)["`]"##)
+        .group("go-exec"),
+    rule("GO010", Critical, GO,
+        "Kullanıcı girdisi SQL sorgusuna doğrudan giriyor (SQL enjeksiyonu)",
+        r"\.(Query|QueryRow|Exec|QueryContext|QueryRowContext|ExecContext|Raw)\s*\(")
+        .tainted().unless(r##"\.(Query|QueryRow|Exec|QueryContext|QueryRowContext|ExecContext|Raw)\s*\(\s*(ctx\s*,\s*)?["`][^"`]*["`]\s*,|\b(c|ctx|URL)\.Query\s*\("##).group("go-sql"),
+    rule("GO011", High, GO, "SQL sorgusu fmt.Sprintf / + ile kuruluyor (SQL enjeksiyonu)",
+        r##"(?i)fmt\.Sprintf\s*\(\s*["`]\s*(select\s.+?\sfrom|insert\s+into|update\s+\S+\s+set|delete\s+from)|["`]\s*(select\s.+?\sfrom|insert\s+into|update\s+\S+\s+set|delete\s+from)\b[^"`]*["`]\s*\+\s*\w"##)
+        .group("go-sql"),
+    rule("GO020", High, GO, "Kullanıcı kontrollü dosya yolu (path traversal)",
+        r"\bos\.(Open|OpenFile|ReadFile|WriteFile|Create|Remove|RemoveAll|ReadDir)\s*\(|\bioutil\.(ReadFile|WriteFile|ReadDir)\s*\(|\bhttp\.ServeFile\s*\(|\bc\.(File|SaveUploadedFile|FileAttachment)\s*\(")
+        .tainted().unless(r"filepath\.Base|path\.Base"),
+    rule("GO030", High, GO, "Kullanıcı kontrollü URL'ye sunucu tarafı istek (SSRF)",
+        r"\bhttp\.(Get|Post|Head|PostForm|NewRequest|NewRequestWithContext)\s*\(|\b\w*[cC]lient\.(Get|Post|Head)\s*\(")
+        .tainted(),
+    rule("GO040", High, GO, "Kullanıcı girdisi kaçışsız HTML'e yazılıyor (XSS)",
+        r"\btemplate\.(HTML|JS|URL|HTMLAttr)\s*\(|\bw\.Write\s*\(|\bfmt\.Fprint(f|ln)?\s*\(\s*w\b|\bio\.WriteString\s*\(\s*w\b|\bc\.(String|Data)\s*\(")
+        .tainted().unless(r"html\.EscapeString|HTMLEscapeString").group("go-xss"),
+    rule("GO041", Medium, GO, "template.HTML ile otomatik kaçış devre dışı (XSS riski)",
+        r##"\btemplate\.(HTML|JS)\s*\(\s*[^"`)\s]"##)
+        .group("go-xss"),
+    rule("GO042", Medium, GO, "Kullanıcı kontrollü yönlendirme (open redirect)",
+        r"\bhttp\.Redirect\s*\(|\bc\.Redirect\s*\(")
+        .tainted(),
+    rule("GO050", High, GO, "TLS doğrulaması kapatılmış", r"InsecureSkipVerify\s*:\s*true"),
+    rule("GO051", Medium, GO, "Kriptografik olarak zayıf özet algoritması (MD5/SHA-1)",
+        r"\b(md5|sha1)\.(New|Sum)\w*\s*\("),
+    rule("GO052", Medium, GO, "Güvenlik değeri math/rand ile üretiliyor (crypto/rand kullanın)",
+        r"(?i)(token|secret|passw|otp|nonce|salt|session)\w*\s*:?=[^=].*\brand\.(Intn|Int31n?|Int63n?|Uint32|Uint64|Float64)\s*\("),
+    rule("GO053", Low, GO, "Zaman aşımı olmayan HTTP sunucusu (Slowloris ile hizmet reddi)",
+        r"\bhttp\.ListenAndServe(TLS)?\s*\("),
+    rule("GO054", Medium, GO, "unsafe.Pointer kullanımı (bellek güvenliği garantisi devre dışı)",
+        r"\bunsafe\.Pointer\b"),
+    rule("GO055", High, GO, "JWT imzası doğrulanmıyor",
+        r"UnsafeAllowNoneSignatureType|SigningMethodNone|\.ParseUnverified\s*\("),
 ];
 
 // ---- Taint (kullanıcı girdisi) izleme -------------------------------------
@@ -409,6 +524,34 @@ impl TaintSpec {
         })
     }
 
+    fn python() -> Result<Self> {
+        Ok(Self {
+            source: re(r"\brequest\.(args|form|values|json|data|files|cookies|headers|get_json|get_data|GET|POST|FILES|COOKIES|META|body|query_params|path_params|stream)\b|(^|[^\w.])input\s*\(|\bsys\.argv\b")?,
+            rhs_source: Some(re(r"^\s*(await\s+)?request\s*$")?),
+            sanitizer: re(r"(^|[^\w.])(int|float|bool|len)\s*\(|\b(shlex\.quote|escape|secure_filename|bleach\.clean|uuid\.UUID|basename|safe_join|model_validate|parse_obj|check_password_hash|generate_password_hash)\s*\(|\bhashlib\.\w+\s*\(|\.(isdigit|isalnum|isdecimal|is_valid)\s*\(|\bre\.(fullmatch|match)\s*\(")?,
+            assigns: vec![
+                re(r"^\s*(?P<lhs>[A-Za-z_]\w*(\s*,\s*[A-Za-z_]\w*)*)\s*(:\s*[^=]+)?(\+|\|)?=\s*(?P<rhs>[^=].*)$")?,
+                re(r"^\s*for\s+(?P<lhs>[A-Za-z_]\w*(\s*,\s*[A-Za-z_]\w*)*)\s+in\s+(?P<rhs>.+):")?,
+            ],
+            ident: re(r"[A-Za-z_]\w*")?,
+            php_style: false,
+        })
+    }
+
+    fn go() -> Result<Self> {
+        Ok(Self {
+            source: re(r"\br\.(URL\.(Query|Path|RawQuery)|FormValue|PostFormValue|Form|PostForm|Body|Header|Cookie|PathValue|MultipartForm|FormFile)\b|\b(mux\.Vars|chi\.URLParam)\s*\(|\bc\.(Query|Param|Params|PostForm|FormValue|GetHeader|DefaultQuery|FormFile|Cookies|Body|BodyParser|ShouldBind\w*|Bind\w*)\s*\(|\bos\.Args\b")?,
+            rhs_source: None,
+            sanitizer: re(r"\b(strconv\.(Atoi|Parse\w+)|filepath\.Base|path\.Base|url\.(QueryEscape|PathEscape)|html\.EscapeString|template\.HTMLEscapeString|uuid\.Parse|bcrypt\.\w+|len)\s*\(|\.MatchString\s*\(")?,
+            assigns: vec![
+                re(r"^\s*(var\s+)?(?P<lhs>[A-Za-z_]\w*(\s*,\s*[A-Za-z_]\w*)*)\s*([\w.\[\]*]+\s*)?(:=|=|\+=)\s*(?P<rhs>[^=].*)$")?,
+                re(r"^\s*for\s+(?P<lhs>[A-Za-z_]\w*(\s*,\s*[A-Za-z_]\w*)*)\s*:=\s*range\s+(?P<rhs>.+?)\s*\{")?,
+            ],
+            ident: re(r"[A-Za-z_]\w*")?,
+            php_style: false,
+        })
+    }
+
     /// Satırda izlenen bir değişken geçiyor mu? (JS'te `obj.x` gibi özellik erişimlerini saymaz)
     fn mentions(&self, text: &str, vars: &HashSet<String>) -> bool {
         if vars.is_empty() {
@@ -429,7 +572,13 @@ impl TaintSpec {
             return self.ident.find_iter(lhs).map(|m| m.as_str().to_string()).collect();
         }
         if !(lhs.starts_with('{') || lhs.starts_with('[')) {
-            return vec![lhs.to_string()];
+            // `a` ya da `a, err` (Python/Go çoklu atama); hata ve boş değişkenler izlenmez
+            return lhs
+                .split(',')
+                .map(str::trim)
+                .filter(|n| !n.is_empty() && !matches!(*n, "_" | "err" | "if" | "for" | "return" | "var"))
+                .map(String::from)
+                .collect();
         }
         // Yapı bozma: { a, b: c, d = 1, ...rest } / [x, y]
         lhs.trim_matches(|c| matches!(c, '{' | '}' | '[' | ']'))
@@ -488,7 +637,77 @@ pub struct Scanner {
     rules: Vec<CompiledRule>,
     php_taint: TaintSpec,
     js_taint: TaintSpec,
+    py_taint: TaintSpec,
+    go_taint: TaintSpec,
     suppress: Regex,
+}
+
+/// Birden fazla satıra yayılmış tek ifade (ör. `exec(\n  cmd,\n  opts)`).
+/// Kurallar birleştirilmiş metne uygulanır; bulgu ilk satıra yazılır.
+struct Stmt {
+    start: usize,
+    end: usize,
+    text: String,
+}
+
+/// Bir ifadeyi en fazla bu kadar satıra kadar birleştir
+const MAX_STMT_LINES: usize = 12;
+
+/// Satırdaki net parantez derinliği (dize içleri sayılmaz).
+fn paren_delta(line: &str) -> i32 {
+    let (mut depth, mut quote, mut escaped) = (0i32, None::<char>, false);
+    for c in line.chars() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '"' | '\'' | '`' => quote = Some(c),
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+    }
+    depth
+}
+
+fn statements(lines: &[&str], code: &[bool], lang: Lang) -> Vec<Stmt> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if !code[i] {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut text = lines[i].to_string();
+        let mut depth = paren_delta(lines[i]);
+        // Rust'ta yaşam süreleri ('a) tırnak sanılır; orada birleştirme yapılmaz.
+        // Satır `{` ile bitiyorsa bir blok açılıyordur (fonksiyon gövdesi), ifade değil.
+        let joinable = lang != Lang::Rust && !lines[i].trim_end().ends_with('{');
+        while joinable && depth > 0 && i + 1 < lines.len() && i + 1 - start < MAX_STMT_LINES {
+            i += 1;
+            if !code[i] {
+                continue;
+            }
+            text.push(' ');
+            text.push_str(lines[i].trim());
+            depth += paren_delta(lines[i]);
+            let t = lines[i].trim_end();
+            if t.ends_with('{') && (t.contains("=>") || t.contains("function") || t.contains("func")) {
+                break; // geri çağırma gövdesi başlıyor
+            }
+        }
+        out.push(Stmt { start, end: i, text });
+        i += 1;
+    }
+    out
 }
 
 impl Scanner {
@@ -510,6 +729,8 @@ impl Scanner {
             rules,
             php_taint: TaintSpec::php()?,
             js_taint: TaintSpec::js()?,
+            py_taint: TaintSpec::python()?,
+            go_taint: TaintSpec::go()?,
             suppress: re(r"autoremediate-ignore\[([A-Za-z0-9_, ]+)\]\s*:\s*\S")?,
         })
     }
@@ -528,10 +749,15 @@ impl Scanner {
     pub fn scan_full(&self, source: &str, lang: Lang) -> ScanResult {
         let lines: Vec<&str> = source.lines().collect();
         let code = code_mask(&lines, lang);
+        let stmts = statements(&lines, &code, lang);
+        let texts: Vec<&str> = stmts.iter().map(|s| s.text.as_str()).collect();
+        let all_code = vec![true; texts.len()];
         let taint = match lang {
-            Lang::Php => self.php_taint.tainted_lines(&lines, &code),
-            Lang::Js => self.js_taint.tainted_lines(&lines, &code),
-            Lang::Rust => vec![false; lines.len()],
+            Lang::Php => self.php_taint.tainted_lines(&texts, &all_code),
+            Lang::Js => self.js_taint.tainted_lines(&texts, &all_code),
+            Lang::Python => self.py_taint.tainted_lines(&texts, &all_code),
+            Lang::Go => self.go_taint.tainted_lines(&texts, &all_code),
+            Lang::Rust => vec![false; texts.len()],
         };
         let suppressed_ids: Vec<Vec<String>> = lines
             .iter()
@@ -544,10 +770,8 @@ impl Scanner {
             .collect();
 
         let mut out = ScanResult::default();
-        for (idx, line) in lines.iter().enumerate() {
-            if !code[idx] {
-                continue;
-            }
+        for (si, stmt) in stmts.iter().enumerate() {
+            let line = stmt.text.as_str();
             let mut groups: HashSet<&str> = HashSet::new();
             for rule in self.rules.iter().filter(|r| r.def.langs.contains(&lang)) {
                 if let Some(g) = rule.def.group {
@@ -555,7 +779,7 @@ impl Scanner {
                         continue;
                     }
                 }
-                if rule.def.needs_taint && !taint[idx] {
+                if rule.def.needs_taint && !taint[si] {
                     continue;
                 }
                 if !rule.re.is_match(line) || rule.unless.as_ref().is_some_and(|u| u.is_match(line)) {
@@ -567,7 +791,7 @@ impl Scanner {
                 let finding = Finding {
                     rule_id: rule.def.id,
                     severity: rule.def.severity,
-                    line: idx + 1,
+                    line: stmt.start + 1,
                     snippet: if rule.def.redact {
                         "[MASKELENDİ]".to_string()
                     } else {
@@ -575,8 +799,9 @@ impl Scanner {
                     },
                     description: rule.def.description,
                 };
-                let is_suppressed = |i: usize| suppressed_ids[i].iter().any(|id| id == rule.def.id);
-                if is_suppressed(idx) || (idx > 0 && is_suppressed(idx - 1)) {
+                let first = stmt.start.saturating_sub(1);
+                let is_suppressed = (first..=stmt.end).any(|i| suppressed_ids[i].iter().any(|id| id == rule.def.id));
+                if is_suppressed {
                     out.suppressed.push(finding);
                 } else {
                     out.findings.push(finding);
@@ -590,13 +815,37 @@ impl Scanner {
     }
 }
 
-/// Yorum olmayan (kod) satırları işaretler: `//`, `/* ... */`, PHP'de `#`.
+/// Yorum olmayan (kod) satırları işaretler: `//`, `/* ... */`, PHP/Python'da `#`,
+/// Python'da üç tırnaklı belge dizeleri.
 fn code_mask(lines: &[&str], lang: Lang) -> Vec<bool> {
     let mut in_block = false;
+    let mut in_doc: Option<&str> = None;
     lines
         .iter()
         .map(|line| {
             let t = line.trim_start();
+            if lang == Lang::Python {
+                if let Some(q) = in_doc {
+                    if t.contains(q) {
+                        in_doc = None;
+                    }
+                    return false;
+                }
+                if t.starts_with('#') {
+                    return false;
+                }
+                for q in ["\"\"\"", "'''"] {
+                    // Satır yalnızca belge dizesiyle başlıyorsa (atamanın parçası değilse)
+                    let body = t.trim_start_matches(['r', 'b', 'u', 'R', 'B', 'U']);
+                    if let Some(rest) = body.strip_prefix(q) {
+                        if !rest.contains(q) {
+                            in_doc = Some(q);
+                        }
+                        return false;
+                    }
+                }
+                return true;
+            }
             if in_block {
                 if t.contains("*/") {
                     in_block = false;
@@ -743,5 +992,58 @@ let u = "http://example.com";
     fn block_comments_are_skipped() {
         assert!(ids(&format!("/*\n {}(req.body.x)\n*/\n", kw(&["ev", "al"])), Lang::Js).is_empty());
         assert!(ids("<?php\n# system($_GET['c']);\n", Lang::Php).is_empty());
+    }
+
+    #[test]
+    fn multiline_calls_are_joined() {
+        let src = "const c = req.query.c;\nexec(\n  c,\n  { timeout: 5 }\n);\n";
+        let s = Scanner::new().unwrap();
+        let f = s.scan(src, Lang::Js);
+        assert_eq!(f.iter().map(|x| x.rule_id).collect::<Vec<_>>(), vec!["JS001"]);
+        assert_eq!(f[0].line, 2, "bulgu ifadenin ilk satırına yazılmalı");
+        // Geri çağırma gövdeleri tek ifadeye katılmaz; içteki satır kendi numarasıyla raporlanır
+        let src = "app.get('/x', (req, res) => {\n  const f = req.query.f;\n  res.sendFile(f);\n});\n";
+        assert_eq!(s.scan(src, Lang::Js)[0].line, 3);
+        // Çok satırlı atamalar da taint taşır
+        let src = "<?php\n$c = trim(\n  $_GET['c']\n);\nsystem($c);\n";
+        assert_eq!(ids(src, Lang::Php), vec!["PHP010"]);
+    }
+
+    #[test]
+    fn python_rules() {
+        let src = "cmd = request.args.get('c')\nos.system('ping ' + cmd)\n";
+        assert_eq!(ids(src, Lang::Python), vec!["PY001"]);
+        let src = "name = request.form['n']\nreturn render_template_string('Merhaba ' + name)\n";
+        assert_eq!(ids(src, Lang::Python), vec!["PY060"]);
+        let src = "uid = request.args['id']\ncur.execute(f\"SELECT * FROM u WHERE id={uid}\")\n";
+        assert_eq!(ids(src, Lang::Python), vec!["PY030"]);
+        let data = format!("obj = {}.loads(request.data)\n", kw(&["pic", "kle"]));
+        assert_eq!(ids(&data, Lang::Python), vec!["PY020"]);
+        assert_eq!(ids("cfg = yaml.load(f)\n", Lang::Python), vec!["PY022"]);
+        assert_eq!(ids("app.run(debug=True)\n", Lang::Python), vec!["PY071"]);
+        assert_eq!(ids("r = requests.get(u, verify=False)\n", Lang::Python), vec!["PY070"]);
+    }
+
+    #[test]
+    fn python_safe_variants_are_quiet() {
+        let src = "\"\"\"\nos.system(request.args['x'])\n\"\"\"\n# os.system(x)\nuid = int(request.args['id'])\ncur.execute('SELECT * FROM u WHERE id = %s', (uid,))\ncfg = yaml.load(f, Loader=yaml.SafeLoader)\nsubprocess.run(['ls', '-l'])\nv = ast.literal_eval(s)\n";
+        assert!(ids(src, Lang::Python).is_empty(), "{:?}", ids(src, Lang::Python));
+    }
+
+    #[test]
+    fn go_rules() {
+        let src = "host := r.URL.Query().Get(\"h\")\nout, err := exec.Command(\"ping\", host).Output()\n";
+        assert_eq!(ids(src, Lang::Go), vec!["GO001"]);
+        let src = "id := r.FormValue(\"id\")\nrows, err := db.Query(\"SELECT * FROM u WHERE id = \" + id)\n";
+        assert_eq!(ids(src, Lang::Go), vec!["GO010"]);
+        assert_eq!(ids("q := fmt.Sprintf(\"SELECT * FROM u WHERE n = '%s'\", n)\n", Lang::Go), vec!["GO011"]);
+        assert_eq!(ids("tr := &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}\n", Lang::Go), vec!["GO050"]);
+        assert_eq!(ids("cmd := exec.Command(\"sh\", \"-c\", script)\n", Lang::Go), vec!["GO002"]);
+    }
+
+    #[test]
+    fn go_safe_variants_are_quiet() {
+        let src = "id, err := strconv.Atoi(r.FormValue(\"id\"))\nif err != nil {\n    http.Error(w, err.Error(), 400)\n}\nrow := db.QueryRow(\"SELECT * FROM u WHERE id = $1\", id)\nname := filepath.Base(r.URL.Query().Get(\"f\"))\nf, err := os.Open(filepath.Join(dir, name))\n";
+        assert!(ids(src, Lang::Go).is_empty(), "{:?}", ids(src, Lang::Go));
     }
 }

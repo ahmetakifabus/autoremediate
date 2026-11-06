@@ -27,6 +27,10 @@ pub enum Ecosystem {
     Packagist,
     #[serde(rename = "crates.io")]
     Crates,
+    #[serde(rename = "PyPI")]
+    PyPI,
+    #[serde(rename = "Go")]
+    Go,
 }
 
 impl Ecosystem {
@@ -35,6 +39,8 @@ impl Ecosystem {
             Ecosystem::Npm => "npm",
             Ecosystem::Packagist => "Packagist",
             Ecosystem::Crates => "crates.io",
+            Ecosystem::PyPI => "PyPI",
+            Ecosystem::Go => "Go",
         }
     }
 
@@ -43,6 +49,8 @@ impl Ecosystem {
             Ecosystem::Npm => format!("npm install {name}@{version}"),
             Ecosystem::Packagist => format!("composer require \"{name}:^{version}\" -W"),
             Ecosystem::Crates => format!("cargo update -p {name} --precise {version}"),
+            Ecosystem::PyPI => format!("pip install \"{name}=={version}\"  (requirements dosyasını da güncelleyin)"),
+            Ecosystem::Go => format!("go get {name}@v{version} && go mod tidy"),
         }
     }
 }
@@ -352,6 +360,10 @@ pub const MANIFEST_NAMES: &[&str] = &[
     "package.json",
     "composer.lock",
     "Cargo.lock",
+    "requirements.txt",
+    "poetry.lock",
+    "Pipfile.lock",
+    "go.mod",
 ];
 
 pub fn is_manifest(path: &Path) -> bool {
@@ -390,6 +402,10 @@ pub fn load(manifests: &[PathBuf]) -> Vec<Dependency> {
             "package.json" => (Ecosystem::Npm, true, parse_package_json(&text)),
             "composer.lock" => (Ecosystem::Packagist, false, parse_composer_lock(&text)),
             "Cargo.lock" => (Ecosystem::Crates, false, Ok(parse_cargo_lock(&text))),
+            "requirements.txt" => (Ecosystem::PyPI, false, Ok(parse_requirements(&text))),
+            "poetry.lock" => (Ecosystem::PyPI, false, Ok(parse_cargo_lock(&text))),
+            "Pipfile.lock" => (Ecosystem::PyPI, false, parse_pipfile_lock(&text)),
+            "go.mod" => (Ecosystem::Go, false, Ok(parse_go_mod(&text))),
             _ => continue,
         };
         match parsed {
@@ -540,6 +556,66 @@ fn parse_cargo_lock(text: &str) -> Vec<Raw> {
     out
 }
 
+/// requirements.txt: yalnızca kesin sabitlenmiş (`==`) sürümler alınır.
+fn parse_requirements(text: &str) -> Vec<Raw> {
+    text.lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('-'))
+        .filter_map(|l| {
+            let l = l.split(';').next()?.trim();
+            let (name, ver) = l.split_once("==")?;
+            let name = name.split('[').next()?.trim().to_ascii_lowercase();
+            let ver = ver.split(',').next()?.trim();
+            (!name.is_empty() && !ver.is_empty()).then(|| (name, ver.to_string()))
+        })
+        .collect()
+}
+
+fn parse_pipfile_lock(text: &str) -> std::result::Result<Vec<Raw>, String> {
+    let v: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for section in ["default", "develop"] {
+        let Some(map) = v.get(section).and_then(Value::as_object) else { continue };
+        for (name, info) in map {
+            if let Some(ver) = info.get("version").and_then(Value::as_str) {
+                out.push((name.to_ascii_lowercase(), ver.trim_start_matches("==").to_string()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// go.mod `require` satırları (tek satırlık ve blok biçimi). `// indirect` dahil.
+fn parse_go_mod(text: &str) -> Vec<Raw> {
+    let mut out = Vec::new();
+    let mut in_block = false;
+    for line in text.lines().map(|l| l.split("//").next().unwrap_or("").trim()) {
+        let spec = if in_block {
+            if line == ")" {
+                in_block = false;
+                continue;
+            }
+            line
+        } else if line == "require (" {
+            in_block = true;
+            continue;
+        } else if let Some(rest) = line.strip_prefix("require ") {
+            rest
+        } else {
+            continue;
+        };
+        let mut parts = spec.split_whitespace();
+        if let (Some(m), Some(v)) = (parts.next(), parts.next()) {
+            // OSV Go sürümlerini "v" öneki olmadan karşılaştırır
+            let v = v.trim_start_matches('v').split("+incompatible").next().unwrap_or("");
+            if !v.is_empty() {
+                out.push((m.to_string(), v.to_string()));
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -611,6 +687,32 @@ mod tests {
 
         let cargo = "[[package]]\nname = \"regex\"\nversion = \"1.10.0\"\nsource = \"registry\"\n";
         assert_eq!(parse_cargo_lock(cargo), vec![("regex".into(), "1.10.0".into())]);
+
+        let req = "Flask==2.2.0  # web
+requests[socks]==2.19.0 ; python_version > '3'
+numpy>=1.0
+-r other.txt
+";
+        assert_eq!(parse_requirements(req), vec![("flask".into(), "2.2.0".into()), ("requests".into(), "2.19.0".into())]);
+
+        let gomod = "module x
+
+go 1.22
+
+require github.com/gin-gonic/gin v1.9.0
+require (
+	golang.org/x/net v0.17.0 // indirect
+	github.com/a/b v2.0.0+incompatible
+)
+";
+        assert_eq!(
+            parse_go_mod(gomod),
+            vec![
+                ("github.com/gin-gonic/gin".into(), "1.9.0".into()),
+                ("golang.org/x/net".into(), "0.17.0".into()),
+                ("github.com/a/b".into(), "2.0.0".into())
+            ]
+        );
 
         let pj = r#"{"dependencies":{"next":"^15.1.0","x":"latest"}}"#;
         assert_eq!(parse_package_json(pj).unwrap(), vec![("next".into(), "15.1.0".into())]);

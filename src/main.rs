@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)] // bu crate'te unsafe yazmak derleme hatasıdır
 
 mod ai;
+mod ci;
 mod controls;
 mod deps;
 mod error;
@@ -9,7 +10,9 @@ mod orchestrator;
 mod osv;
 mod patcher;
 mod recon;
+mod report;
 mod scanner;
+mod upgrade;
 mod util;
 
 use std::path::{Path, PathBuf};
@@ -25,33 +28,42 @@ use crate::gemini::{GeminiClient, GeminiConfig};
 use crate::orchestrator::{Config, Orchestrator, Outcome};
 use crate::patcher::Patcher;
 use crate::recon::SiteReport;
+use crate::report::{part_of, Part, Report};
 use crate::scanner::{Finding, Lang, Scanner};
 use crate::util::SKIP_DIRS;
 
 const USAGE: &str = "\
 Kullanım: autoremediate [dosya|dizin] [--site <adres>] [seçenekler]
 
-Siteyi bir bina gibi düşünün; araç dört şeye bakar:
+Siteyi bir bina gibi düşünün; hırsız zayıf noktayı görürse oradan girer. Araç altı şeye bakar:
   1) Hırsızın gözü     --site ile yayındaki siteye DIŞARIDAN bakar (açık pencere, unutulmuş anahtar)
   2) Kırık duvarlar    koddaki açıklar → LLM ile yamalanır, yeniden taranarak doğrulanır
   3) Eksik kameralar   kurulmamış savunmalar (helmet, rate limit, CSRF, güvenli çerez...) → takılır
-  4) Çürük malzeme     savunmasız bağımlılıklar (React2Shell vb.) → yükseltme komutu önerilir
+  4) Kilitsiz kapılar  kimlik doğrulaması olmayan /admin, API ve Server Action'lar → kilitlenir
+  5) Çürük temel       nginx / Apache / php.ini / Dockerfile ayarları, desteği bitmiş PHP/Node/Python
+  6) Çürük malzeme     savunmasız bağımlılıklar (React2Shell vb.) → --fix-deps ile değiştirilir
 
-Kaynak kod:  Rust (.rs), PHP (.php .phtml ...), JavaScript/TypeScript (.js .mjs .cjs .jsx .ts .tsx)
-Bağımlılık:  package-lock.json, yarn.lock, pnpm-lock.yaml, package.json, composer.lock, Cargo.lock
+Kaynak kod:  Rust, PHP, JavaScript/TypeScript, Python, Go
+Bağımlılık:  package-lock.json, yarn.lock, pnpm-lock.yaml, package.json, composer.lock, Cargo.lock,
+             requirements.txt, poetry.lock, Pipfile.lock, go.mod
 
   --scan-only            Sadece tara ve raporla, hiçbir dosyayı değiştirme (API anahtarı gerekmez)
   --site <adres>         Yayındaki siteye dışarıdan bak (YALNIZCA sahibi olduğunuz / izinli siteler)
-  --dry-run              Yamaları ve kurulacak savunmaları göster, dosyaya yazma
-  --no-harden            Eksik savunmaları (kameraları) kurma, sadece duvarları yamala
+  --dry-run              Yamaları, kurulacak savunmaları ve yükseltmeleri göster, dosyaya yazma
+  --no-harden            Eksik savunmaları (kameraları / kilitleri) kurma, sadece duvarları yamala
+  --fix-deps             Savunmasız bağımlılıkları paket yöneticisiyle yükselt; açık kapanmazsa
+                         ya da --validate başarısızsa geri al
   --provider <ad>        gemini | anthropic (verilmezse anahtarı tanımlı olan seçilir)
   --max-iter <N>         En fazla döngü sayısı (varsayılan 5, üst sınır 20)
-  --validate \"<komut>\"   Her değişiklikten sonra çalışacak doğrulama (örn. \"npx tsc --noEmit\", \"cargo check -q\")
+  --validate \"<komut>\"   Her değişiklikten sonra çalışacak doğrulama (örn. \"npm test\", \"cargo check -q\")
   --validate-dir <dizin> Doğrulama komutunun çalışma dizini
   --osv                  Bağımlılıkları canlı OSV veritabanında da sorgula
                          (osv.dev'e yalnızca paket adı + sürüm gönderilir)
   --no-deps              Bağımlılık denetimini atla
   --json                 --scan-only çıktısını JSON olarak ver (CI için)
+  --sarif <dosya>        Bulguları SARIF olarak yaz (GitHub Security sekmesi)
+  --html <dosya>         Tek dosyalık HTML rapor yaz (güvenlik puanı + tüm bölümler)
+  --init-ci              Projeye bekçi ekle: her push/PR/hafta tarayan GitHub Actions iş akışı
 
 Ortam: GEMINI_API_KEY (+ GEMINI_MODEL) veya ANTHROPIC_API_KEY (+ AUTOFIX_MODEL); --scan-only için gerekmez";
 
@@ -71,33 +83,55 @@ struct Cli {
     dry_run: bool,
     scan_only: bool,
     harden: bool,
+    fix_deps: bool,
     max_iter: u32,
     validate: Option<Vec<String>>,
     validate_dir: Option<PathBuf>,
     osv: bool,
     deps: bool,
     json: bool,
+    sarif: Option<PathBuf>,
+    html: Option<PathBuf>,
+    init_ci: bool,
 }
 
 fn parse_args() -> Result<Cli> {
     let mut args = std::env::args().skip(1);
-    let (mut target, mut site, mut dry_run, mut scan_only, mut harden) = (None, None, false, false, true);
-    let (mut max_iter, mut validate, mut validate_dir) = (5u32, None, None);
-    let (mut osv, mut deps, mut json) = (false, true, false);
-    let mut provider: Option<Provider> = None;
+    let mut cli = Cli {
+        target: None,
+        site: None,
+        provider: None,
+        dry_run: false,
+        scan_only: false,
+        harden: true,
+        fix_deps: false,
+        max_iter: 5,
+        validate: None,
+        validate_dir: None,
+        osv: false,
+        deps: true,
+        json: false,
+        sarif: None,
+        html: None,
+        init_ci: false,
+    };
     let need = |name: &str| Error::Config(format!("{name} bir değer bekliyor"));
 
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--dry-run" => dry_run = true,
-            "--scan-only" => scan_only = true,
-            "--no-harden" => harden = false,
-            "--osv" => osv = true,
-            "--no-deps" => deps = false,
-            "--json" => json = true,
-            "--site" => site = Some(args.next().ok_or_else(|| need("--site"))?),
+            "--dry-run" => cli.dry_run = true,
+            "--scan-only" => cli.scan_only = true,
+            "--no-harden" => cli.harden = false,
+            "--fix-deps" => cli.fix_deps = true,
+            "--osv" => cli.osv = true,
+            "--no-deps" => cli.deps = false,
+            "--json" => cli.json = true,
+            "--init-ci" => cli.init_ci = true,
+            "--site" => cli.site = Some(args.next().ok_or_else(|| need("--site"))?),
+            "--sarif" => cli.sarif = Some(PathBuf::from(args.next().ok_or_else(|| need("--sarif"))?)),
+            "--html" => cli.html = Some(PathBuf::from(args.next().ok_or_else(|| need("--html"))?)),
             "--provider" => {
-                provider = Some(match args.next().ok_or_else(|| need("--provider"))?.as_str() {
+                cli.provider = Some(match args.next().ok_or_else(|| need("--provider"))?.as_str() {
                     "gemini" => Provider::Gemini,
                     "anthropic" => Provider::Anthropic,
                     other => return Err(Error::Config(format!("bilinmeyen sağlayıcı: {other}"))),
@@ -105,34 +139,41 @@ fn parse_args() -> Result<Cli> {
             }
             "--max-iter" => {
                 let v = args.next().ok_or_else(|| need("--max-iter"))?;
-                max_iter = v
+                cli.max_iter = v
                     .parse::<u32>()
                     .map_err(|_| Error::Config(format!("geçersiz --max-iter: {v}")))?
                     .clamp(1, 20);
             }
             "--validate" => {
                 let v = args.next().ok_or_else(|| need("--validate"))?;
-                validate = Some(v.split_whitespace().map(String::from).collect());
+                cli.validate = Some(v.split_whitespace().map(String::from).collect());
             }
             "--validate-dir" => {
-                validate_dir = Some(PathBuf::from(args.next().ok_or_else(|| need("--validate-dir"))?));
+                cli.validate_dir = Some(PathBuf::from(args.next().ok_or_else(|| need("--validate-dir"))?));
             }
+            "-V" | "--version" => return Err(Error::Config(format!("autoremediate {}", env!("CARGO_PKG_VERSION")))),
             "-h" | "--help" => return Err(Error::Config(USAGE.into())),
             o if o.starts_with("--") => return Err(Error::Config(format!("bilinmeyen seçenek: {o}\n\n{USAGE}"))),
             o => {
-                if target.replace(PathBuf::from(o)).is_some() {
+                if cli.target.replace(PathBuf::from(o)).is_some() {
                     return Err(Error::Config("yalnızca tek hedef verilebilir".into()));
                 }
             }
         }
     }
-    if target.is_none() && site.is_none() {
+    if cli.target.is_none() && cli.site.is_none() {
         return Err(Error::Config(USAGE.into()));
     }
-    if json && !scan_only {
+    if cli.json && !cli.scan_only {
         return Err(Error::Config("--json yalnızca --scan-only ile kullanılabilir".into()));
     }
-    Ok(Cli { target, site, provider, dry_run, scan_only, harden, max_iter, validate, validate_dir, osv, deps, json })
+    if cli.fix_deps && cli.scan_only {
+        return Err(Error::Config("--fix-deps dosya değiştirir; --scan-only ile birlikte kullanılamaz".into()));
+    }
+    if cli.init_ci && cli.target.as_ref().is_none_or(|t| !t.is_dir()) {
+        return Err(Error::Config("--init-ci için hedef bir proje dizini olmalı".into()));
+    }
+    Ok(cli)
 }
 
 #[derive(Default)]
@@ -214,6 +255,27 @@ async fn audit_deps(manifests: &[PathBuf], use_osv: bool) -> Vec<DepFinding> {
     deps::merge(builtin, osv)
 }
 
+type Located = Vec<(PathBuf, Finding)>;
+
+/// Tüm kaynakları tarar: (bulgular, bastırılmış bulgular)
+fn scan_walls(sources: &[(PathBuf, Lang)]) -> Result<(Located, Located)> {
+    let scanner = Scanner::new()?;
+    let (mut walls, mut suppressed) = (Vec::new(), Vec::new());
+    for (f, lang) in sources {
+        let src = match std::fs::read_to_string(f) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("{} okunamadı: {e}", f.display());
+                continue;
+            }
+        };
+        let r = scanner.scan_full(&src, *lang);
+        walls.extend(r.findings.into_iter().map(|x| (f.clone(), x)));
+        suppressed.extend(r.suppressed.into_iter().map(|x| (f.clone(), x)));
+    }
+    Ok((walls, suppressed))
+}
+
 // ---- Rapor ---------------------------------------------------------------
 
 fn section(title: &str) {
@@ -250,20 +312,32 @@ fn print_walls(findings: &[(PathBuf, Finding)], suppressed: &[(PathBuf, Finding)
     }
 }
 
+const PARTS: [(Part, &str, &str); 3] = [
+    (Part::Cameras, "3) Eksik kameralar — kurulmamış savunmalar", "Bilinen temel savunmalar yerinde."),
+    (Part::Locks, "4) Kilitsiz kapılar — kimlik doğrulaması olmayan hassas kapılar", "Kilitsiz hassas kapı bulunmadı."),
+    (Part::Infra, "5) Çürük temel — sunucu ve çalışma ortamı", "Sunucu yapılandırmasında bilinen sorun bulunmadı."),
+];
+
 fn print_cameras(list: &[ControlFinding]) {
-    section("3) Eksik kameralar — kurulmamış savunmalar");
-    if list.is_empty() {
-        println!("  ✔ Bilinen temel savunmalar yerinde.");
-    }
-    for c in list {
-        println!("  [{}] {} {} — {}", c.severity, c.id, c.title, c.location.display());
-        println!("        Neden önemli: {}", c.why);
-        println!("        Kurulum: {}", c.how_to_fix);
+    for (part, title, ok) in PARTS {
+        section(title);
+        let items: Vec<&ControlFinding> = list.iter().filter(|c| part_of(c) == part).collect();
+        if items.is_empty() {
+            println!("  ✔ {ok}");
+        }
+        for c in items {
+            println!("  [{}] {} {} — {}", c.severity, c.id, c.title, c.location.display());
+            if !c.detail.is_empty() {
+                println!("        {}", c.detail);
+            }
+            println!("        Neden önemli: {}", c.why);
+            println!("        Kurulum: {}", c.how_to_fix);
+        }
     }
 }
 
 fn print_deps(findings: &[DepFinding]) {
-    section("4) Çürük malzeme — savunmasız bağımlılıklar");
+    section("6) Çürük malzeme — savunmasız bağımlılıklar");
     if findings.is_empty() {
         println!("  ✔ Bilinen savunmasız bağımlılık bulunmadı.");
         return;
@@ -287,7 +361,7 @@ fn print_deps(findings: &[DepFinding]) {
     }
     let rec = deps::recommendations(findings);
     if !rec.is_empty() {
-        println!("\n  Önerilen yükseltmeler (yükselttikten sonra tekrar tarayın):");
+        println!("\n  Önerilen yükseltmeler (ya da --fix-deps ile otomatik):");
         for (eco, pkg, ver) in rec {
             println!("    {}", eco.upgrade_hint(&pkg, &ver));
         }
@@ -306,10 +380,51 @@ fn print_suppressed(file: &Path, list: &[Finding]) {
     }
 }
 
+fn print_score(r: &Report) {
+    let (score, grade) = r.score();
+    println!("  Güvenlik puanı: {score}/100 (not: {grade})");
+}
+
+/// İstenen dosya raporlarını (SARIF / HTML) yazar.
+fn write_reports(cli: &Cli, r: &Report) -> Result<()> {
+    if let Some(p) = &cli.sarif {
+        let text = serde_json::to_string_pretty(&r.to_sarif()).map_err(|e| Error::Config(e.to_string()))?;
+        std::fs::write(p, text).map_err(|e| Error::io(p, e))?;
+        info!("SARIF raporu yazıldı: {}", p.display());
+    }
+    if let Some(p) = &cli.html {
+        std::fs::write(p, r.to_html()).map_err(|e| Error::io(p, e))?;
+        info!("HTML raporu yazıldı: {}", p.display());
+    }
+    Ok(())
+}
+
+/// Yeni savunmaların gerektirdiği paketler: ekosisteme göre kurulum komutu
+fn print_package_hint(packages: &[&str]) {
+    let (pip, npm): (Vec<&str>, Vec<&str>) = packages.iter().partition(|p| p.starts_with("pip:"));
+    if !npm.is_empty() {
+        println!("    npm install {}", npm.join(" "));
+    }
+    if !pip.is_empty() {
+        let names: Vec<&str> = pip.iter().map(|p| p.trim_start_matches("pip:")).collect();
+        println!("    pip install {}  (requirements dosyasına da ekleyin)", names.join(" "));
+    }
+}
+
 // ---- Çalıştırma ----------------------------------------------------------
 
 async fn run() -> Result<ExitCode> {
     let cli = parse_args()?;
+
+    // Bekçi kurulumu
+    if cli.init_ci {
+        if let Some(t) = &cli.target {
+            match ci::init(t) {
+                Ok(p) => println!("✔ Bekçi eklendi: {} (commit edip push'layın; ayrıntılar dosyanın başında)", p.display()),
+                Err(e) => println!("• {e}"),
+            }
+        }
+    }
 
     // 1) Hırsızın gözü
     let site = match &cli.site {
@@ -323,11 +438,14 @@ async fn run() -> Result<ExitCode> {
 
     let Some(target) = cli.target.clone() else {
         // Sadece dış bakış
+        let r = Report { root: Path::new("."), site: site.as_ref(), walls: &[], suppressed: &[], cameras: &[], deps: &[] };
         if cli.json {
-            print_json(site.as_ref(), &[], &[], &[], &[]);
+            println!("{}", serde_json::to_string_pretty(&r.to_json()).unwrap_or_default());
         } else if let Some(s) = &site {
             print_site(s);
+            print_score(&r);
         }
+        write_reports(&cli, &r)?;
         return Ok(if site_bad { ExitCode::from(1) } else { ExitCode::SUCCESS });
     };
 
@@ -337,24 +455,11 @@ async fn run() -> Result<ExitCode> {
     let dep_findings = if cli.deps { audit_deps(&targets.manifests, cli.osv).await } else { Vec::new() };
 
     if cli.scan_only {
-        let scanner = Scanner::new()?;
-        let mut walls: Vec<(PathBuf, Finding)> = Vec::new();
-        let mut suppressed: Vec<(PathBuf, Finding)> = Vec::new();
-        for (f, lang) in &targets.sources {
-            let src = match std::fs::read_to_string(f) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("{} okunamadı: {e}", f.display());
-                    continue;
-                }
-            };
-            let r = scanner.scan_full(&src, *lang);
-            walls.extend(r.findings.into_iter().map(|x| (f.clone(), x)));
-            suppressed.extend(r.suppressed.into_iter().map(|x| (f.clone(), x)));
-        }
+        let (walls, suppressed) = scan_walls(&targets.sources)?;
         let cameras = controls::audit(&project);
+        let r = Report { root: &root, site: site.as_ref(), walls: &walls, suppressed: &suppressed, cameras: &cameras, deps: &dep_findings };
         if cli.json {
-            print_json(site.as_ref(), &walls, &suppressed, &cameras, &dep_findings);
+            println!("{}", serde_json::to_string_pretty(&r.to_json()).unwrap_or_default());
         } else {
             if let Some(s) = &site {
                 print_site(s);
@@ -363,18 +468,22 @@ async fn run() -> Result<ExitCode> {
             print_cameras(&cameras);
             print_deps(&dep_findings);
             section("Özet");
+            let n = |p: Part| cameras.iter().filter(|c| part_of(c) == p).count();
             println!(
-                "  {} açık pencere (dışarıdan), {} kırık duvar, {} eksik kamera, {} çürük malzeme, {} bastırılmış bulgu ({} kaynak dosya).",
+                "  {} açık pencere, {} kırık duvar, {} eksik kamera, {} kilitsiz kapı, {} çürük temel, {} çürük malzeme, {} bastırılmış bulgu ({} kaynak dosya).",
                 site.as_ref().map_or(0, |s| s.findings.len()),
                 walls.len(),
-                cameras.len(),
+                n(Part::Cameras),
+                n(Part::Locks),
+                n(Part::Infra),
                 dep_findings.len(),
                 suppressed.len(),
                 targets.sources.len()
             );
+            print_score(&r);
         }
-        let failing = site_bad || !walls.is_empty() || !cameras.is_empty() || !dep_findings.is_empty();
-        return Ok(if failing { ExitCode::from(1) } else { ExitCode::SUCCESS });
+        write_reports(&cli, &r)?;
+        return Ok(if r.has_findings() { ExitCode::from(1) } else { ExitCode::SUCCESS });
     }
 
     if let Some(s) = &site {
@@ -384,55 +493,81 @@ async fn run() -> Result<ExitCode> {
     let needs_llm = !targets.sources.is_empty() || (cli.harden && !controls::audit(&project).is_empty());
     if needs_llm {
         let provider = match cli.provider {
-            Some(p) => p,
-            None => detect_provider()?,
+            Some(p) => Some(p),
+            None => match detect_provider() {
+                Ok(p) => Some(p),
+                // Yalnızca bağımlılık yükseltmesi istendiyse LLM adımları atlanabilir
+                Err(e) if cli.fix_deps => {
+                    warn!("{e} — duvar/kamera adımları atlandı, yalnızca bağımlılıklar yükseltilecek");
+                    None
+                }
+                Err(e) => return Err(e),
+            },
         };
         let c = match provider {
-            Provider::Gemini => {
+            Some(Provider::Gemini) => {
                 let cfg = GeminiConfig::from_env()?;
                 info!("Sağlayıcı: Gemini ({})", cfg.model());
                 drive(GeminiClient::new(cfg)?, &cli, &targets.sources, &project).await?
             }
-            Provider::Anthropic => {
+            Some(Provider::Anthropic) => {
                 drive(AnthropicClient::new(LlmConfig::from_env()?)?, &cli, &targets.sources, &project).await?
             }
+            None => 0,
         };
         code = code.max(c);
     }
+
+    // 6) Çürük malzeme
     if !dep_findings.is_empty() {
-        print_deps(&dep_findings);
-        println!("  Not: bağımlılıklar otomatik yükseltilmez; yukarıdaki komutları çalıştırıp testleri koşun.");
-        code = code.max(1);
+        if cli.fix_deps {
+            section("6) Çürük malzeme — değiştiriliyor");
+            let rep = upgrade::apply(&dep_findings, cli.validate.as_deref(), cli.dry_run).await;
+            for (d, step) in &rep.planned {
+                println!("  • {} (dry-run): {step}", d.display());
+            }
+            for (d, pkg) in &rep.upgraded {
+                println!("  ✔ {pkg} — {}", d.display());
+            }
+            for (d, why) in &rep.failed {
+                println!("  ✘ {} — {why}", d.display());
+                code = code.max(1);
+            }
+            if !rep.upgraded.is_empty() {
+                println!("  Not: kilit dosyaları güncellendi; değişiklikleri inceleyip commit edin.");
+            }
+        } else {
+            print_deps(&dep_findings);
+            println!("  Not: otomatik yükseltme için --fix-deps kullanın.");
+            code = code.max(1);
+        }
+    }
+
+    // Son durum: değişikliklerden sonra bina yeniden kontrol edilir
+    if !cli.dry_run {
+        let targets = collect_files(&target)?;
+        let project = Project { root: &root, sources: &targets.sources, manifests: &targets.manifests };
+        let (walls, suppressed) = scan_walls(&targets.sources)?;
+        let cameras = controls::audit(&project);
+        let deps_after = if cli.deps { audit_deps(&targets.manifests, cli.osv).await } else { Vec::new() };
+        let r = Report { root: &root, site: site.as_ref(), walls: &walls, suppressed: &suppressed, cameras: &cameras, deps: &deps_after };
+        section("Son durum");
+        let n = |p: Part| cameras.iter().filter(|c| part_of(c) == p).count();
+        println!(
+            "  {} kırık duvar, {} eksik kamera, {} kilitsiz kapı, {} çürük temel, {} çürük malzeme kaldı.",
+            walls.len(),
+            n(Part::Cameras),
+            n(Part::Locks),
+            n(Part::Infra),
+            deps_after.len()
+        );
+        print_score(&r);
+        write_reports(&cli, &r)?;
+        if r.has_findings() {
+            code = code.max(1);
+        }
     }
     Ok(ExitCode::from(code))
-}
-
-fn print_json(
-    site: Option<&SiteReport>,
-    walls: &[(PathBuf, Finding)],
-    suppressed: &[(PathBuf, Finding)],
-    cameras: &[ControlFinding],
-    deps: &[DepFinding],
-) {
-    let row = |(f, x): &(PathBuf, Finding)| {
-        serde_json::json!({
-            "file": f, "line": x.line, "rule_id": x.rule_id, "severity": x.severity,
-            "description": x.description, "snippet": x.snippet,
-        })
-    };
-    let upgrades: Vec<_> = deps::recommendations(deps)
-        .into_iter()
-        .map(|(e, p, v)| serde_json::json!({"ecosystem": e, "package": p, "version": v}))
-        .collect();
-    let report = serde_json::json!({
-        "site": site.map(|s| serde_json::json!({"url": s.url, "technology": s.tech, "findings": s.findings})),
-        "code_findings": walls.iter().map(row).collect::<Vec<_>>(),
-        "suppressed": suppressed.iter().map(row).collect::<Vec<_>>(),
-        "missing_defenses": cameras,
-        "dependency_findings": deps,
-        "upgrades": upgrades,
-    });
-    println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
 }
 
 /// --provider verilmediyse hangi anahtar tanımlıysa onu seç.
@@ -449,7 +584,7 @@ fn detect_provider() -> Result<Provider> {
     }
 }
 
-/// Önce duvarlar (kod açıkları) yamalanır, sonra kameralar (eksik savunmalar) takılır.
+/// Önce duvarlar (kod açıkları) yamalanır, sonra kameralar ve kilitler takılır.
 async fn drive<P: PatchProvider>(
     provider: P,
     cli: &Cli,
@@ -506,7 +641,7 @@ async fn drive<P: PatchProvider>(
         return Ok(code);
     }
 
-    section("3) Eksik kameralar — takılıyor");
+    section("3–5) Eksik kameralar, kilitsiz kapılar ve çürük temel — takılıyor");
     let report = controls::install(project, orch.provider(), orch.scanner(), orch.patcher(), cli.dry_run).await?;
     for (p, id) in &report.installed {
         println!("  ✔ {id} takıldı — {}", p.display());
@@ -520,11 +655,14 @@ async fn drive<P: PatchProvider>(
     }
     for c in &report.manual {
         println!("  ✋ [{}] {} {} — {}", c.severity, c.id, c.title, c.how_to_fix);
+        if !c.detail.is_empty() {
+            println!("        {}", c.detail);
+        }
         code = code.max(1);
     }
     if !report.packages.is_empty() {
         println!("\n  Yeni savunmalar şu paketleri kullanıyor; kurun ve testleri çalıştırın:");
-        println!("    npm install {}", report.packages.join(" "));
+        print_package_hint(&report.packages);
     }
     if report.installed.is_empty() && report.failed.is_empty() && report.manual.is_empty() && report.dry_run_notes.is_empty() {
         println!("  ✔ Bilinen temel savunmalar zaten yerinde.");

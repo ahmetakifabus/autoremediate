@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+      - name: Örnekler üzerinde uçtan uca tarama (bulgu beklenir → çıkış kodu 1)
+        shell: bash
+        run: |
+          set +e
+          cargo run --locked --release -- samples --scan-only --sarif samples.sarif --html samples.html
+          code=$?
+          test "$code" -eq 1 || { echo "beklenen çıkış kodu 1, gelen $code"; exit 1; }
+          test -s samples.sarif && test -s samples.html

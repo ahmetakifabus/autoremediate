@@ -1,0 +1,58 @@
+# v* etiketi push'landığında Windows / Linux / macOS için derler ve GitHub Release oluşturur.
+#   git tag v1.1.0 && git push origin v1.1.0
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: autoremediate-linux-x86_64
+            bin: autoremediate
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: autoremediate-windows-x86_64.exe
+            bin: autoremediate.exe
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: autoremediate-macos-arm64
+            bin: autoremediate
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo test --locked
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Dosyayı adlandır
+        shell: bash
+        run: cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Sağlama toplamları
+        run: cd dist && sha256sum * > SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
