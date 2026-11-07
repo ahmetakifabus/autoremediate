@@ -308,7 +308,7 @@ impl PatchProvider for AnyProvider {
 pub fn catalog() -> Vec<(&'static str, &'static str, String, &'static str, bool)> {
     let mut v = vec![
         ("anthropic", "Anthropic Claude", "ANTHROPIC_API_KEY".to_string(), "claude-sonnet-5-5", env("ANTHROPIC_API_KEY").is_some()),
-        ("gemini", "Google Gemini", "GEMINI_API_KEY".to_string(), "gemini-2.5-flash", env("GEMINI_API_KEY").is_some()),
+        ("gemini", "Google Gemini", "GEMINI_API_KEY".to_string(), "gemini-3.8-flash", env("GEMINI_API_KEY").is_some()),
     ];
     for p in PRESETS {
         let key = match (p.auth, p.base_env) {

@@ -45,7 +45,7 @@ impl GeminiConfig {
         })
     }
 
-    /// GEMINI_API_KEY (zorunlu), GEMINI_MODEL (varsayılan gemini-2.5-flash),
+    /// GEMINI_API_KEY (zorunlu), GEMINI_MODEL (varsayılan gemini-3.8-flash),
     /// GEMINI_BASE_URL (opsiyonel; test/proxy için).
     pub fn from_env_with_model(model: Option<&str>) -> Result<Self> {
         let key = std::env::var("GEMINI_API_KEY")
@@ -55,7 +55,7 @@ impl GeminiConfig {
             model
                 .map(String::from)
                 .or_else(|| std::env::var("GEMINI_MODEL").ok())
-                .unwrap_or_else(|| "gemini-2.5-flash".into()),
+                .unwrap_or_else(|| "gemini-3.8-flash".into()),
             std::env::var("GEMINI_BASE_URL")
                 .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".into()),
         )
@@ -247,7 +247,7 @@ mod tests {
     #[test]
     fn rejects_bad_model_name() {
         assert!(GeminiConfig::new("k".into(), "../evil?x=1".into(), "http://x".into()).is_err());
-        assert!(GeminiConfig::new("".into(), "gemini-2.5-flash".into(), "http://x".into()).is_err());
+        assert!(GeminiConfig::new("".into(), "gemini-3.8-flash".into(), "http://x".into()).is_err());
     }
 
     /// Yerel sahte sunucu: 1. istek 503, 2. istek 200 → retry + başlık + yol kontrolü.
@@ -299,7 +299,7 @@ mod tests {
 
         let cfg = GeminiConfig::new(
             "test-key-123".into(),
-            "gemini-2.5-flash".into(),
+            "gemini-3.8-flash".into(),
             format!("http://127.0.0.1:{port}"),
         )
         .unwrap();
@@ -312,7 +312,7 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 2, "503 sonrası bir kez yeniden denemeli");
         let head = seen[1].to_lowercase();
-        assert!(head.starts_with("post /v1beta/models/gemini-2.5-flash:generatecontent "));
+        assert!(head.starts_with("post /v1beta/models/gemini-3.8-flash:generatecontent "));
         assert!(head.contains("x-goog-api-key: test-key-123"));
         assert!(!head.lines().next().unwrap().contains("test-key-123"), "anahtar URL'de olmamalı");
     }

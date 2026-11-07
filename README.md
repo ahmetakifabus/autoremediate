@@ -86,7 +86,7 @@ sıraya göre ilki seçilir; istediğinizi `--provider` ile seçebilirsiniz.
 | `--provider` | Servis | Ortam değişkeni | Varsayılan model |
 |---|---|---|---|
 | `anthropic` | Anthropic Claude | `ANTHROPIC_API_KEY` | claude-sonnet-5-5 |
-| `gemini` | Google Gemini | `GEMINI_API_KEY` | gemini-2.5-flash |
+| `gemini` | Google Gemini | `GEMINI_API_KEY` | gemini-3.8-flash |
 | `openai` | OpenAI | `OPENAI_API_KEY` | gpt-5 |
 | `openrouter` | OpenRouter (yüzlerce model, tek anahtar) | `OPENROUTER_API_KEY` | anthropic/claude-sonnet-4.5 |
 | `deepseek` | DeepSeek | `DEEPSEEK_API_KEY` | deepseek-chat |
